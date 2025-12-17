@@ -1,394 +1,500 @@
-# ---------------------------------------------------------------------------
-# Library
-# ---------------------------------------------------------------------------
+# ============================================================================== 
+# --- IMPORTS --- 
+# ==============================================================================
 
+# --- Standard Library Imports ---
 import re
 from itertools import product
 from functools import lru_cache
 
+# --- Third-party Imports ---
 import pandas as pd
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqUtils import MeltingTemp as mt
 
-# -------------------------
-# Utility functions
-# -------------------------
+# ============================================================================== 
+# --- CORE BIOINFORMATICS UTILITY FUNCTIONS --- 
+# ==============================================================================
 
-def calculate_gc_content(seq: str) -> float:
-    """Return GC% (0-100) rounded to 2 decimals."""
-    if not seq:
+def calculate_gc_content(sequence):
+    """
+    Calculates the GC content of a DNA sequence.
+
+    Args:
+        sequence (str): The DNA sequence string.
+
+    Returns:
+        float: The percentage of G and C bases, rounded to two decimal places.
+               Returns 0.0 if the sequence is empty.
+    """
+    if not sequence:
         return 0.0
-    s = seq.upper()
-    gc = s.count("G") + s.count("C")
-    return round(gc / len(s) * 100.0, 2)
+    gc_count = sequence.count("G") + sequence.count("C")
+    return round(gc_count / len(sequence) * 100, 2)
 
+def extract_kmers(sequence, k_range):
+    """
+    Yields all k-mers of specified lengths from a sequence.
 
-def extract_kmers(sequence: str, k_range: range):
-    """Yield all k-mers for lengths in k_range."""
+    This is a generator function that produces k-mers on-the-fly to save memory,
+    rather than storing them all in a list.
+
+    Args:
+        sequence (str): The DNA sequence.
+        k_range (range): A range of k-mer lengths to extract (e.g., range(18, 26)).
+
+    Yields:
+        str: The next k-mer found in the sequence.
+    """
     if not sequence:
         return
-    seq = sequence.upper()
     for k in k_range:
-        if 0 < k <= len(seq):
-            for i in range(len(seq) - k + 1):
-                yield seq[i : i + k]
+        if 0 < k <= len(sequence):
+            for i in range(len(sequence) - k + 1):
+                yield sequence[i:i+k]
 
-
+# Pre-computed map for fast base complementarity checks.
 COMPLEMENT_MAP = {"A": "T", "T": "A", "G": "C", "C": "G"}
 
+def are_bases_complementary(base1, base2):
+    """Checks if two DNA bases are complementary using a fast lookup."""
+    return COMPLEMENT_MAP.get(base1) == base2
 
-def reverse_complement(sequence: str) -> str:
-    """Reverse complement using Biopython Seq."""
+def reverse_complement(sequence):
+    """Computes the reverse complement of a DNA sequence using Biopython."""
     return str(Seq(sequence).reverse_complement())
 
+def find_longest_complementary_run(seq1, seq2):
+    """
+    Finds the length of the longest perfectly complementary substring between two sequences.
+    This is used to predict secondary structures like hairpins and dimers.
 
-def find_longest_complementary_run(a: str, b: str) -> int:
+    This function uses a memory-optimized dynamic programming approach (O(n) space).
+
+    Args:
+        seq1 (str): The first DNA sequence.
+        seq2 (str): The second DNA sequence.
+
+    Returns:
+        int: The length of the longest complementary run.
     """
-    Return length of longest perfectly complementary substring between a and b.
-    Memory-optimized DP.
-    """
-    a, b = a.upper(), b.upper()
-    m, n = len(a), len(b)
+    m, n = len(seq1), len(seq2)
     if m == 0 or n == 0:
         return 0
-    dp = [0] * (n + 1)
-    best = 0
+
+    dp_row = [0] * (n + 1)
+    max_len = 0
+
     for i in range(1, m + 1):
-        prev = 0
+        prev_diagonal_val = 0
         for j in range(1, n + 1):
-            cur = dp[j]
-            if COMPLEMENT_MAP.get(a[i - 1]) == b[j - 1]:
-                dp[j] = prev + 1
-                if dp[j] > best:
-                    best = dp[j]
+            current_dp_j = dp_row[j]
+            if are_bases_complementary(seq1[i-1], seq2[j-1]):
+                dp_row[j] = prev_diagonal_val + 1
+                if dp_row[j] > max_len:
+                    max_len = dp_row[j]
             else:
-                dp[j] = 0
-            prev = cur
-    return best
+                dp_row[j] = 0
+            prev_diagonal_val = current_dp_j
+    return max_len
 
-
-def calculate_melting_temp(sequence: str, na_conc: float = 50e-3) -> float:
-    """Return Tm using Biopython nearest-neighbor (rounded)."""
+def calculate_melting_temp(sequence, na_conc=50e-3):
+    """
+    Calculates the melting temperature (Tm) using Biopython's nearest-neighbor model.
+    """
     try:
-        return round(mt.Tm_NN(str(Seq(sequence)), Na=na_conc), 1)
+        return round(mt.Tm_NN(str(sequence), Na=na_conc), 1)
     except Exception:
         return 0.0
 
+def extract_isoform_id(name):
+    """
+    Extracts the isoform ID from a sequence name like 'CASC15-205 cDNA (4297 bp)'.
+    Returns '205' from 'CASC15-205'.
+    """
+    match = re.search(r"CASC15-(\d+)", name)
+    if not match:
+        print(f"⚠️ Could not extract isoform ID from: {name}")
+    return match.group(1) if match else ""
 
-def extract_isoform_id(name: str) -> str:
+def check_primer_hits(primer, sequences):
     """
-    Extract isoform numeric ID from a name like 'CASC15-205 ...'.
-    Returns empty string if none found.
+    Finds all sequence records that contain a given primer sequence
+    or its reverse complement.
     """
-    m = re.search(r"-([0-9]+)", name)
-    return m.group(1) if m else ""
-
-
-def check_primer_hits(primer: str, sequences):
-    """
-    Return dict with total hits and comma-separated isoform ids where primer
-    or its reverse complement occurs.
-    """
-    rc = reverse_complement(primer)
-    hits = [rec.id for rec in sequences if primer in str(rec.seq).upper() or rc in str(rec.seq).upper()]
+    primer_rc = reverse_complement(primer)
+    hits = [
+        rec.id
+        for rec in sequences
+        if primer in str(rec.seq) or primer_rc in str(rec.seq)
+    ]
     return {"total": len(hits), "isoforms": ",".join(hits)}
 
-
-def find_candidate_primers(sequence: str, k_range: range, gc_min: float, gc_max: float, tm_min: float, tm_max: float):
-    """Return list of k-mers that meet GC% and Tm constraints."""
-    seq = sequence.upper()
+def find_candidate_primers(sequence, k_range, gc_min, gc_max, tm_min, tm_max):
     candidates = []
     for k in k_range:
-        if k <= 0 or k > len(seq):
-            continue
-        for i in range(len(seq) - k + 1):
-            kmer = seq[i : i + k]
+        for i in range(len(sequence) - k + 1):
+            kmer = sequence[i:i + k]
             gc = calculate_gc_content(kmer)
-            tm = calculate_melting_temp(kmer)
+            tm = mt.Tm_NN(Seq(kmer))
             if gc_min <= gc <= gc_max and tm_min <= tm <= tm_max:
                 candidates.append(kmer)
     return candidates
 
+# ============================================================================== 
+# --- PRIMER DESIGN CORE LOGIC --- 
+# ==============================================================================
 
 @lru_cache(maxsize=10000)
-def check_cached_primer_hits(primer: str, sequences_tuple):
+def check_cached_primer_hits(primer, sequences_tuple):
     """
-    Cached wrapper for check_primer_hits.
-    sequences_tuple: tuple of (id, seq_str)
+    A cached wrapper for `check_primer_hits` to avoid re-computing hits
+    for the same primer. The `lru_cache` decorator memoizes the results.
     """
-    records = [SeqIO.SeqRecord(Seq(seq), id=name) for name, seq in sequences_tuple]
-    return check_primer_hits(primer, records)
-
+    # The cache requires hashable arguments, so we convert the tuple back to a list of records.
+    sequences = [SeqIO.SeqRecord(Seq(seq), id=name) for name, seq in sequences_tuple]
+    return check_primer_hits(primer, sequences)
 
 def prepare_sequences_for_caching(sequences):
-    """Return tuple of (id, seq_str) for caching."""
-    return tuple((rec.id, str(rec.seq).upper()) for rec in sequences)
-
-
-# -------------------------
-# Primer design functions
-# -------------------------
-
-def design_race_primers(sequences, params, mode):
-    """
-    Design RACE primers (windowed at ends).
-    Returns {"best": {id: pair_or_None}, "other": {id: [pairs]}}.
-    """
-    seq_tuple = prepare_sequences_for_caching(sequences)
-    best = {}
-    other = {}
-
-    for rec in sequences:
-        name = rec.id
-        seq = str(rec.seq).upper()
-        if len(seq) < 2 * params["window_size"]:
-            best[name] = None
-            other[name] = []
-            continue
-
-        fw_region = seq[: params["window_size"]]
-        rev_region = seq[-params["window_size"] :]
-        rev_template = reverse_complement(rev_region)
-
-        fw_cands = find_candidate_primers(fw_region, params["k_range"], params["gc_min"], params["gc_max"], params["tm_min"], params["tm_max"])
-        rv_cands = find_candidate_primers(rev_template, params["k_range"], params["gc_min"], params["gc_max"], params["tm_min"], params["tm_max"])
-
-        if not fw_cands or not rv_cands:
-            best[name] = None
-            other[name] = []
-            continue
-
-        fw_checks = {fw: check_cached_primer_hits(fw, seq_tuple) for fw in fw_cands}
-        rv_checks = {rv: check_cached_primer_hits(rv, seq_tuple) for rv in rv_cands}
-
-        valid_fw = fw_cands
-        valid_rv = rv_cands
-        if mode == "specificity":
-            iso = extract_isoform_id(name)
-            valid_fw = [fw for fw, chk in fw_checks.items() if iso in chk["isoforms"]]
-            valid_rv = [rv for rv, chk in rv_checks.items() if iso in chk["isoforms"]]
-
-        best_pair = None
-        other_pairs = []
-        for fw, rv in product(valid_fw, valid_rv):
-            pair = {"forward": fw, "reverse": rv, "product_size": None}
-            if mode == "specificity":
-                if not best_pair:
-                    best_pair = pair
-                if len(other_pairs) < 10:
-                    other_pairs.append(pair)
-
-        best[name] = best_pair
-        other[name] = other_pairs
-
-    return {"best": best, "other": other}
-
+    """Converts a list of SeqRecord objects to a hashable tuple for caching."""
+    return tuple((rec.id, str(rec.seq)) for rec in sequences)
 
 def design_qpcr_primers(sequences, params, mode):
     """
-    Design qPCR primers by scanning full sequences.
-    Returns {"best": {id: pair_or_None}, "other": {id: [pairs]}}.
-    """
-    seq_tuple = prepare_sequences_for_caching(sequences)
-    best = {}
-    other = {}
+    Main logic for designing qPCR primers for either specificity or coverage.
 
+    NOTE: Modified to search across the ENTIRE sequence for qPCR primers (user request).
+    """
+    sequences_tuple = prepare_sequences_for_caching(sequences)
+    best_primers = {}
+    other_options = {}
+
+    # We now scan the full sequence (not restricted to fw_start/fw_end windows)
     for rec in sequences:
         name = rec.id
-        seq = str(rec.seq).upper()
+        seq = str(rec.seq)
+
         if len(seq) < params["prod_min"]:
-            best[name] = None
-            other[name] = []
+            best_primers[name] = None
+            other_options[name] = []
             continue
 
-        fw_cands = find_candidate_primers(seq, params["k_range"], params["gc_min"], params["gc_max"], params["tm_min"], params["tm_max"])
-        rev_template_cands = find_candidate_primers(seq, params["k_range"], params["gc_min"], params["gc_max"], params["tm_min"], params["tm_max"])
+        # Scan entire sequence for forward and reverse-template candidates
+        fw_candidates = find_candidate_primers(
+            seq,  # full sequence
+            params["k_range"],
+            params["gc_min"],
+            params["gc_max"],
+            params["tm_min"],
+            params["tm_max"]
+        )
+        rev_template_candidates = find_candidate_primers(
+            seq,  # full sequence
+            params["k_range"],
+            params["gc_min"],
+            params["gc_max"],
+            params["tm_min"],
+            params["tm_max"]
+        )
 
-        rev_map = {reverse_complement(p): p for p in rev_template_cands}
-        if not fw_cands or not rev_map:
-            best[name] = None
-            other[name] = []
+        # Create a map of reverse-complement (actual reverse primer) -> template k-mer found in seq
+        rev_candidates_map = {reverse_complement(p): p for p in rev_template_candidates}
+
+        if not fw_candidates or not rev_candidates_map:
+            best_primers[name] = None
+            other_options[name] = []
             continue
 
-        fw_checks = {fw: check_cached_primer_hits(fw, seq_tuple) for fw in fw_cands}
-        rev_checks = {rv: check_cached_primer_hits(rv, seq_tuple) for rv in rev_map.keys()}
+        # Check which isoforms each primer hits
+        fw_checks = {fw: check_cached_primer_hits(fw, sequences_tuple) for fw in fw_candidates}
+        rev_checks = {rv: check_cached_primer_hits(rv, sequences_tuple) for rv in rev_candidates_map.keys()}
 
-        valid_fw = fw_cands
-        valid_rv = list(rev_map.keys())
+        valid_fw = fw_candidates
+        valid_rev = list(rev_candidates_map.keys())
+
         if mode == "specificity":
-            iso = extract_isoform_id(name)
-            valid_fw = [fw for fw, chk in fw_checks.items() if iso in chk["isoforms"]]
-            valid_rv = [rv for rv, chk in rev_checks.items() if iso in chk["isoforms"]]
+            isoform_id = extract_isoform_id(name)
+            valid_fw = [
+                fw for fw, check in fw_checks.items()
+                if isoform_id in check["isoforms"]
+            ]
+            valid_rev = [
+                rv for rv, check in rev_checks.items()
+                if isoform_id in check["isoforms"]
+            ]
+
+        print(f"🔍 [{name}] Found {len(valid_fw)} FW primers, {len(valid_rev)} REV primers.")
 
         best_pair = None
         other_pairs = []
-        for fw, rv in product(valid_fw, valid_rv):
+
+        for fw, rv in product(valid_fw, valid_rev):
+            # Find positions in sequence (searching full seq)
             fw_pos = seq.find(fw)
-            rv_template = rev_map[rv]
-            rv_pos = seq.find(rv_template)
-            if fw_pos == -1 or rv_pos == -1 or fw_pos >= rv_pos:
+            rv_template = rev_candidates_map[rv]
+            rv_template_pos = seq.find(rv_template)
+
+            if fw_pos == -1 or rv_template_pos == -1:
                 continue
-            product_size = (rv_pos + len(rv_template)) - fw_pos
+
+            # Ensure forward is before reverse
+            if fw_pos >= rv_template_pos:
+                continue
+
+            # Calculate product size
+            product_size = (rv_template_pos + len(rv_template)) - fw_pos
+
             if not (params["prod_min"] <= product_size <= params["prod_max"]):
                 continue
-            pair = {"forward": fw, "reverse": rv, "product_size": product_size}
+
+            primer_pair = {
+                "forward": fw,
+                "reverse": rv,
+                "product_size": product_size
+            }
+
             if mode == "specificity":
                 if not best_pair:
-                    best_pair = pair
+                    best_pair = primer_pair
                 if len(other_pairs) < 10:
-                    other_pairs.append(pair)
+                    other_pairs.append(primer_pair)
 
-        best[name] = best_pair
-        other[name] = other_pairs
+        best_primers[name] = best_pair
+        other_options[name] = other_pairs
 
-    return {"best": best, "other": other}
+    return {"best": best_primers, "other": other_options}
 
+def design_race_primers(sequences, params, mode):
+    """
+    Main logic for designing RACE primers for either specificity or coverage.
+    """
+    sequences_tuple = prepare_sequences_for_caching(sequences)
+    best_primers = {}
+    other_options = {}
+
+    valid_sequences = [(rec.id, str(rec.seq)) for rec in sequences
+                       if len(str(rec.seq)) >= 2 * params["window_size"]]
+
+    if not valid_sequences:
+        return {"best": best_primers, "other": other_options}
+
+    for name, seq in valid_sequences:
+        fw_region = seq[:params["window_size"]]
+        rev_region = seq[-params["window_size"]:]
+        rev_template = reverse_complement(rev_region)  # reverse strand (3'–5')
+
+        fw_candidates = find_candidate_primers(
+            fw_region,
+            params["k_range"],
+            params["gc_min"],
+            params["gc_max"],
+            params["tm_min"],
+            params["tm_max"]
+        )
+        rev_candidates = find_candidate_primers(
+            rev_template,
+            params["k_range"],
+            params["gc_min"],
+            params["gc_max"],
+            params["tm_min"],
+            params["tm_max"]
+        )
+
+        print(f"\n🧬 Isoform: {name}")
+        print(f"Forward region: {fw_region[:50]}...")
+        print(f"Reverse region: {rev_region[:50]}...")
+        print(f"Rev template strand: {rev_template[:50]}...")
+        print(f"First FW primers: {fw_candidates[:3]}")
+        print(f"First REV primers: {rev_candidates[:3]}")
+
+        if not fw_candidates or not rev_candidates:
+            best_primers[name] = None
+            other_options[name] = []
+            continue
+
+        fw_checks = {fw: check_cached_primer_hits(fw, sequences_tuple) for fw in fw_candidates}
+        rev_checks = {rv: check_cached_primer_hits(rv, sequences_tuple) for rv in rev_candidates}
+
+        valid_fw = fw_candidates
+        valid_rev = rev_candidates
+        if mode == "specificity":
+            isoform_id = extract_isoform_id(name)
+            valid_fw = [fw for fw, check in fw_checks.items() if isoform_id in check["isoforms"]]
+            valid_rev = [rv for rv, check in rev_checks.items() if isoform_id in check["isoforms"]]
+
+        print(f"Valid FW (specific): {[p[:10] for p in valid_fw]}")
+        print(f"Valid REV (specific): {[p[:10] for p in valid_rev]}")
+
+        best_pair = None
+        other_pairs = []
+
+        for fw, rv in product(valid_fw, valid_rev):
+            primer_pair = {"forward": fw, "reverse": rv, "product_size": None}
+            if mode == "specificity":
+                if not best_pair:  # Only store the first valid pair as best
+                    best_pair = primer_pair
+                if len(other_pairs) < 10:  # Store up to 10 other options
+                    other_pairs.append(primer_pair)
+            else: # coverage mode
+                # Coverage mode shouldn't be using this function at all
+                pass
+
+        best_primers[name] = best_pair
+        other_options[name] = other_pairs
+
+    return {"best": best_primers, "other": other_options}
 
 def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
     """
-    Greedy set-cover over isoforms: choose primer pairs that cover the most isoforms until none left.
-    Returns {"selected": [pairs], "pending": [isoform_ids]}.
+    Finds a minimal set of primer pairs to amplify all isoforms (Set Cover Problem).
+    This uses a greedy algorithm approach for efficiency.
     """
-    isoforms = {rec.id for rec in sequences}
+    all_isoform_names = {rec.id for rec in sequences}
     params = params_qpcr if primer_type == "qPCR" else params_race
-
-    fw_kmers = {}
-    rv_kmers = {}
-
-    for rec in sequences:
-        seq = str(rec.seq).upper()
+    
+    def get_regions(seq_str):
         if primer_type == "qPCR":
-            fw_region = rv_region = seq
-        else:
-            fw_region = seq[: params["window_size"]]
-            rv_region = seq[-params["window_size"] :]
+            return (seq_str[params["fw_start"] - 1:params["fw_end"]],
+                    seq_str[params["rev_start"] - 1:params["rev_end"]])
+        else: # RACE
+            return (seq_str[:params["window_size"]], seq_str[-params["window_size"]:])
 
-        fw_valid = set()
-        rv_valid = set()
-
+    # Pre-compute all valid k-mers and the isoforms they hit.
+    fw_kmer_hits = {}
+    rv_kmer_hits = {}
+    for rec in sequences:
+        seq_str = str(rec.seq)
+        fw_region, rv_region = get_regions(seq_str)
+        
         for kmer in extract_kmers(fw_region, params["k_range"]):
-            if params["gc_min"] <= calculate_gc_content(kmer) <= params["gc_max"] and params["tm_min"] <= calculate_melting_temp(kmer) <= params["tm_max"]:
-                fw_valid.add(kmer)
+            if params["gc_min"] <= calculate_gc_content(kmer) <= params["gc_max"]:
+                fw_kmer_hits.setdefault(kmer, set()).add(rec.id)
 
-        rv_region_use = rv_region if primer_type == "qPCR" else reverse_complement(rv_region)
-        for kmer in extract_kmers(rv_region_use, params["k_range"]):
-            if params["gc_min"] <= calculate_gc_content(kmer) <= params["gc_max"] and params["tm_min"] <= calculate_melting_temp(kmer) <= params["tm_max"]:
-                rv_valid.add(kmer)
+        for kmer in extract_kmers(rv_region, params["k_range"]):
+            if params["gc_min"] <= calculate_gc_content(kmer) <= params["gc_max"]:
+                rv_kmer_hits.setdefault(kmer, set()).add(rec.id)
 
-        fw_kmers[rec.id] = fw_valid
-        rv_kmers[rec.id] = rv_valid
+    # Use a greedy algorithm to find the best primer pairs.
+    selected_pairs = []
+    pending_isoforms = all_isoform_names.copy()
+    
+    # Create all potential primer pair combinations and their coverage.
+    combinations = []
+    for fw_kmer, fw_hits in fw_kmer_hits.items():
+        for rv_kmer, rv_hits in rv_kmer_hits.items():
+            # The coverage of a pair is the intersection of isoforms hit by each primer.
+            common_hits = fw_hits.intersection(rv_hits)
+            if common_hits:
+                combinations.append((fw_kmer, rv_kmer, common_hits))
 
-    all_fw = set().union(*fw_kmers.values()) if fw_kmers else set()
-    all_rv = set().union(*rv_kmers.values()) if rv_kmers else set()
-
-    def pair_coverage(fw, rv):
-        covered = set()
-        for rec in sequences:
-            iso = rec.id
-            seq = str(rec.seq).upper()
-            if fw not in fw_kmers.get(iso, set()) or rv not in rv_kmers.get(iso, set()):
-                continue
-            fw_pos = seq.find(fw)
-            if primer_type == "qPCR":
-                rv_rc = reverse_complement(rv)
-                rv_pos = seq.find(rv_rc)
-                if fw_pos != -1 and rv_pos != -1 and fw_pos < rv_pos:
-                    size = (rv_pos + len(rv_rc)) - fw_pos
-                    if params["prod_min"] <= size <= params["prod_max"]:
-                        covered.add(iso)
-            else:
-                if fw_pos != -1:
-                    region_3 = seq[-params["window_size"] :]
-                    if reverse_complement(rv) in region_3:
-                        covered.add(iso)
-        return covered
-
-    combos = []
-    for fw in all_fw:
-        for rv in all_rv:
-            cov = pair_coverage(fw, rv)
-            if cov:
-                combos.append((fw, rv, cov))
-
-    selected = []
-    pending = set(isoforms)
-    while pending and combos:
-        best_combo = max(combos, key=lambda x: len(x[2].intersection(pending)))
-        fw, rv, cov = best_combo
-        new = cov.intersection(pending)
-        if not new:
+    while pending_isoforms and combinations:
+        # Find the pair that covers the most remaining isoforms
+        best_pair = max(combinations, key=lambda item: len(item[2].intersection(pending_isoforms)))
+        fw, rv, covered_by_best = best_pair
+        newly_covered = covered_by_best.intersection(pending_isoforms)
+        
+        if not newly_covered:
             break
-        selected.append({"forward": fw, "reverse": rv, "isoforms": sorted(list(cov))})
-        pending -= new
-        combos.remove(best_combo)
+            
+        selected_pairs.append({
+            "forward": fw,
+            "reverse": rv,
+            "isoforms": list(newly_covered)
+        })
+        pending_isoforms -= newly_covered
+        combinations.remove(best_pair)
 
-    return {"selected": selected, "pending": sorted(list(pending))}
+    return {"selected": selected_pairs, "pending": list(pending_isoforms)}
 
-
-# -------------------------
-# Helpers & top-level
-# -------------------------
+# ============================================================================== 
+# --- SCRIPT EXECUTION --- 
+# ==============================================================================
 
 def parse_params(qpcr_params, race_params):
-    """Normalize UI-style params to internal form (ranges -> range, gc -> percent)."""
     if qpcr_params:
         qpcr_params = {
-            "k_range": range(qpcr_params["k_range"][0], qpcr_params["k_range"][1]),
-            "gc_min": qpcr_params["gc_range"][0] * 100,
-            "gc_max": qpcr_params["gc_range"][1] * 100,
-            "prod_min": qpcr_params["prod_range"][0],
-            "prod_max": qpcr_params["prod_range"][1],
-            "tm_min": qpcr_params["tm_range"][0],
-            "tm_max": qpcr_params["tm_range"][1],
+            "fw_start": qpcr_params["fw_range"][0],         # Start position for forward primer search region.
+            "fw_end": qpcr_params["fw_range"][1],           # End position for forward primer search region.
+            "rev_start": qpcr_params["rev_range"][0],       # Start position for reverse primer search region.
+            "rev_end": qpcr_params["rev_range"][1],         # End position for reverse primer search region.
+            "k_range": range(                               # Range of possible k-mer (primer) lengths.
+                qpcr_params["k_range"][0], 
+                qpcr_params["k_range"][1]
+            ),   
+            "gc_min": qpcr_params["gc_range"][0]*100,       # Minimum GC content percentage.
+            "gc_max": qpcr_params["gc_range"][1]*100,       # Maximum GC content percentage.
+            "prod_min": qpcr_params["prod_range"][0],       # Minimum PCR product size.
+            "prod_max": qpcr_params["prod_range"][1],       # Maximum PCR product size.
+            "tm_min": qpcr_params["tm_range"][0],           # Minimum melting temperature (Tm).
+            "tm_max": qpcr_params["tm_range"][1],           # Maximum melting temperature (Tm).
         }
     if race_params:
         race_params = {
-            "window_size": race_params["window_size"],
-            "k_range": range(race_params["k_range"][0], race_params["k_range"][1]),
-            "gc_min": race_params["gc_range"][0] * 100,
-            "gc_max": race_params["gc_range"][1] * 100,
-            "tm_min": race_params["tm_range"][0],
-            "tm_max": race_params["tm_range"][1],
+            "window_size": race_params["window_size"],      # Size of the search window from the 5' and 3' ends.
+            "k_range": range(                               # Range of possible k-mer (primer) lengths.
+                race_params["k_range"][0], 
+                race_params["k_range"][1]
+            ),   
+            "gc_min": race_params["gc_range"][0]*100,       # Minimum GC content percentage.
+            "gc_max": race_params["gc_range"][1]*100,       # Maximum GC content percentage.
+            "tm_min": race_params["tm_range"][0],           # Minimum melting temperature (Tm).
+            "tm_max": race_params["tm_range"][1],           # Maximum melting temperature (Tm).
         }
     return qpcr_params, race_params
 
 
 def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_params):
     """
-    Main pipeline. Returns:
-      - specificity: (num_sequences, best_df, other_df)
-      - coverage: (num_sequences, coverage_df, None)
+    Main function to execute the primer design pipeline.
+    Returns:
+        - For specificity mode: tuple of (num_sequences, best_pairs_df, other_pairs_df)
+        - For coverage mode: tuple of (num_sequences, coverage_df, None)
     """
+    print(f"📂 Reading FASTA file: {fasta_file_path}")
+    num_sequences = 0
     try:
-        records = list(SeqIO.parse(fasta_file_path, "fasta"))
+        sequence_set = list(SeqIO.parse(fasta_file_path, "fasta"))
+        if not sequence_set:
+            print("❌ Error: No sequences found in the FASTA file.")
+            return (None, None) if design_mode == "specificity" else None
+        num_sequences = len(sequence_set)
+        print(f"✅ Loaded {num_sequences} sequences.")
     except FileNotFoundError:
-        print(f"FASTA not found: {fasta_file_path}")
-        return None, None, None
-
-    if not records:
-        print("No sequences found in FASTA.")
-        return None, None, None
+        print(f"❌ Error: FASTA file not found at '{fasta_file_path}'")
+        return (None, None) if design_mode == "specificity" else None
 
     qpcr_params, race_params = parse_params(qpcr_params, race_params)
 
+    results = None
     if design_mode == "specificity":
+        print(f"🧬 Running in SPECIFICITY mode for {primer_type} primers...")
         if primer_type == "qPCR":
-            results = design_qpcr_primers(records, qpcr_params, design_mode)
+            results = design_qpcr_primers(sequence_set, qpcr_params, design_mode)
         elif primer_type == "RACE":
-            results = design_race_primers(records, race_params, design_mode)
+            results = design_race_primers(sequence_set, race_params, design_mode)
         else:
-            print("Unsupported primer type.")
-            return None, None, None
+            print(f"⚠️ Unsupported primer type: {primer_type}")
+            return None, None
+    elif design_mode == "coverage":
+        print(f"🎯 Running in COVERAGE mode for {primer_type} primers...")
+        results = find_coverage_primers(sequence_set, qpcr_params, race_params, primer_type)
+    else:
+        print(f"⚠️ Unsupported design mode: {design_mode}")
+        return (None, None) if design_mode == "specificity" else None
 
-        best_rows = []
-        other_rows = []
-        for iso, pair in results["best"].items():
-            if not pair:
+    # --- Process and Return Results ---
+    if design_mode == "specificity":
+        # Process best pairs
+        best_df_rows = []
+        other_df_rows = []
+        
+        for isoform_name, pair in results["best"].items():
+            if not pair: 
                 continue
             f, r = pair["forward"], pair["reverse"]
-            best_rows.append({
-                "Isoform": iso,
+            best_df_rows.append({
+                "Isoform": isoform_name,
                 "Primer_Forward": f,
                 "Primer_Reverse": r,
                 "GC_Forward": calculate_gc_content(f),
@@ -400,15 +506,17 @@ def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_p
                 "SelfDimer_Forward": find_longest_complementary_run(f, f),
                 "SelfDimer_Reverse": find_longest_complementary_run(r, r),
                 "CrossDimer": find_longest_complementary_run(f, reverse_complement(r)),
-                "Product_Size": pair.get("product_size"),
+                "Product_Size": pair.get("product_size", None)
             })
-        for iso, pairs in results["other"].items():
+
+        # Process other pairs (up to 10 per isoform)
+        for isoform_name, pairs in results["other"].items():
             for pair in pairs:
                 if not pair:
                     continue
                 f, r = pair["forward"], pair["reverse"]
-                other_rows.append({
-                    "Isoform": iso,
+                other_df_rows.append({
+                    "Isoform": isoform_name,
                     "Primer_Forward": f,
                     "Primer_Reverse": r,
                     "GC_Forward": calculate_gc_content(f),
@@ -420,39 +528,52 @@ def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_p
                     "SelfDimer_Forward": find_longest_complementary_run(f, f),
                     "SelfDimer_Reverse": find_longest_complementary_run(r, r),
                     "CrossDimer": find_longest_complementary_run(f, reverse_complement(r)),
-                    "Product_Size": pair.get("product_size"),
+                    "Product_Size": pair.get("product_size", None)
                 })
 
-        best_df = pd.DataFrame(best_rows) if best_rows else None
-        other_df = pd.DataFrame(other_rows) if other_rows else None
-        if best_df is not None and not best_df.empty:
-            best_df.index = range(1, len(best_df) + 1)
-        if other_df is not None and not other_df.empty:
-            other_df.index = range(1, len(other_df) + 1)
+        best_df = pd.DataFrame(best_df_rows) if best_df_rows else None
+        other_df = pd.DataFrame(other_df_rows) if other_df_rows else None
 
-        return len(records), best_df, other_df
+        if best_df is not None and not best_df.empty: best_df.index = range(1, len(best_df) + 1)
+        if other_df is not None and not other_df.empty: other_df.index = range(1, len(other_df) + 1)
+        
+        print("✅ Finished specificity design.")
+        return num_sequences, best_df, other_df
 
     elif design_mode == "coverage":
-        results = find_coverage_primers(records, qpcr_params, race_params, primer_type)
-        rows = []
-        for i, item in enumerate(results["selected"], 1):
-            f, r = item["forward"], item["reverse"]
-            rows.append({
-                "Pair_ID": f"Pair_{i}",
-                "Primer_Forward": f,
-                "Primer_Reverse": r,
-                "GC_Forward": calculate_gc_content(f),
-                "GC_Reverse": calculate_gc_content(r),
-                "Tm_Forward": calculate_melting_temp(f),
-                "Tm_Reverse": calculate_melting_temp(r),
-                "Num_Isoforms": len(item["isoforms"]),
+        coverage_df_rows = []
+        for item in results["selected"]:
+            coverage_df_rows.append({
+                "Primer_Forward": item["forward"],
+                "Primer_Reverse": item["reverse"],
                 "Covered_Isoforms": ";".join(item["isoforms"]),
             })
-        cov_df = pd.DataFrame(rows) if rows else None
-        if cov_df is not None and not cov_df.empty:
-            cov_df.index = range(1, len(cov_df) + 1)
-        return len(records), cov_df, None
 
-    else:
-        print("Unsupported design mode.")
-        return None, None, None
+        coverage_df = pd.DataFrame(coverage_df_rows) if coverage_df_rows else None
+
+        if coverage_df is not None and not coverage_df.empty: coverage_df.index = range(1, len(coverage_df) + 1)
+
+        print("✅ Finished coverage design.")
+        return num_sequences, coverage_df, None
+
+
+if __name__ == "__main__":
+    # testing (locally)
+    FASTA_FILE_PATH = "./sample_data/avengers-3.fa"
+    PRIMER_TYPE = "RACE"
+    DESIGN_MODE = "specificity" 
+    PARAMS_QPCR = {
+        'fw_range': (50, 100), 
+        'rev_range': (150, 200), 
+        'k_range': (18, 26), 
+        'gc_range': (0.5, 0.7), 
+        'prod_range': (80, 150), 
+        'tm_range': (57.0, 62.0)
+    }
+    PARAMS_RACE = {
+        'window_size': 200, 
+        'k_range': (23, 29), 
+        'gc_range': (0.5, 0.7), 
+        'tm_range': (57.0, 62.0)
+    }
+    create_design(FASTA_FILE_PATH, PRIMER_TYPE, DESIGN_MODE, PARAMS_QPCR, PARAMS_RACE)
