@@ -259,56 +259,152 @@ def design_race_primers(sequences, params, mode):
     return {"best": best_primers, "other": other_options}
 def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
     """
-    Finds a minimal set of primer pairs to amplify all isoforms (Set Cover Problem).
-    This uses a greedy algorithm approach for efficiency.
+    Greedy set-cover for primer pairs.
+
+    For qPCR: scans full sequences but avoids enumerating all fw×rv combinations.
+    For RACE: uses windows at 5' and 3' ends (existing behavior).
     """
-    all_isoform_names = {rec.id for rec in sequences}
+    # Map id -> sequence string (uppercase)
+    seq_map = {rec.id: str(rec.seq).upper() for rec in sequences}
+    all_isoform_names = set(seq_map.keys())
     params = params_qpcr if primer_type == "qPCR" else params_race
-    # --- only change: for qPCR use the ENTIRE sequence as both regions ---
+
+    # Helper to get regions
     def get_regions(seq_str):
         if primer_type == "qPCR":
-            # For qPCR we scan the full sequence (forward and reverse searches use full seq)
             return seq_str, seq_str
-        else:  # RACE (use windows at ends)
-            return seq_str[:params["window_size"]], seq_str[-params["window_size"]:]
-    # Pre-compute all valid k-mers and the isoforms they hit.
-    fw_kmer_hits = {}
-    rv_kmer_hits = {}
-    for rec in sequences:
-        seq_str = str(rec.seq)
+        else:
+            return seq_str[: params["window_size"]], seq_str[-params["window_size"] :]
+
+    # Build fw_kmers_by_isoform and rv_kmers_by_isoform (store kmers UPPER)
+    fw_kmers_by_isoform = {}
+    rv_kmers_by_isoform = {}
+    for iso, seq_str in seq_map.items():
         fw_region, rv_region = get_regions(seq_str)
-        for kmer in extract_kmers(fw_region, params["k_range"]):
-            if params["gc_min"] <= calculate_gc_content(kmer) <= params["gc_max"]:
-                fw_kmer_hits.setdefault(kmer, set()).add(rec.id)
-        for kmer in extract_kmers(rv_region, params["k_range"]):
-            if params["gc_min"] <= calculate_gc_content(kmer) <= params["gc_max"]:
-                rv_kmer_hits.setdefault(kmer, set()).add(rec.id)
-    # Use a greedy algorithm to find the best primer pairs.
+        fw_set = set(k.upper() for k in extract_kmers(fw_region, params["k_range"]))
+        rv_set = set(k.upper() for k in extract_kmers(rv_region, params["k_range"]))
+        # Filter by GC and Tm
+        fw_valid = {k for k in fw_set if params["gc_min"] <= calculate_gc_content(k) <= params["gc_max"] and params["tm_min"] <= calculate_melting_temp(k) <= params["tm_max"]}
+        rv_valid = {k for k in rv_set if params["gc_min"] <= calculate_gc_content(k) <= params["gc_max"] and params["tm_min"] <= calculate_melting_temp(k) <= params["tm_max"]}
+        fw_kmers_by_isoform[iso] = fw_valid
+        rv_kmers_by_isoform[iso] = rv_valid
+
+    # Build inverted indexes: primer -> isoforms it appears in
+    fw_index = {}
+    rv_index = {}
+    for iso in seq_map:
+        for k in fw_kmers_by_isoform.get(iso, set()):
+            fw_index.setdefault(k, set()).add(iso)
+        for k in rv_kmers_by_isoform.get(iso, set()):
+            rv_index.setdefault(k, set()).add(iso)
+
+    # Prepare candidate lists
+    all_fw = list(fw_index.keys())
+    all_rv = list(rv_index.keys())
+
+    # Greedy selection
     selected_pairs = []
-    pending_isoforms = all_isoform_names.copy()
-    # Create all potential primer pair combinations and their coverage.
-    combinations = []
-    for fw_kmer, fw_hits in fw_kmer_hits.items():
-        for rv_kmer, rv_hits in rv_kmer_hits.items():
-            # The coverage of a pair is the intersection of isoforms hit by each primer.
-            common_hits = fw_hits.intersection(rv_hits)
-            if common_hits:
-                combinations.append((fw_kmer, rv_kmer, common_hits))
-    while pending_isoforms and combinations:
-        # Find the pair that covers the most remaining isoforms
-        best_pair = max(combinations, key=lambda item: len(item[2].intersection(pending_isoforms)))
-        fw, rv, covered_by_best = best_pair
-        newly_covered = covered_by_best.intersection(pending_isoforms)
-        if not newly_covered:
-            break
-        selected_pairs.append({
-            "forward": fw,
-            "reverse": rv,
-            "isoforms": list(newly_covered)
-        })
-        pending_isoforms -= newly_covered
-        combinations.remove(best_pair)
-    return {"selected": selected_pairs, "pending": list(pending_isoforms)}
+    pending = set(all_isoform_names)
+
+    # Quick bailout: no candidates
+    if not all_fw or not all_rv:
+        return {"selected": [], "pending": sorted(list(pending))}
+
+    # For qPCR we must check product size constraints; for RACE we do simpler coverage check
+    if primer_type == "qPCR":
+        prod_min = params["prod_min"]
+        prod_max = params["prod_max"]
+
+        # Precompute for speed reverse_complements of rv templates
+        rv_to_rc = {rv: reverse_complement(rv) for rv in all_rv}
+
+        # Greedy loop: instead of enumerating all fw×rv, evaluate promising fw and for each find best rv
+        while pending:
+            best_pair = None
+            best_cover = set()
+
+            # Optionally limit number of fw candidates considered per round if too many
+            # e.g., consider fw candidates sorted by how many pending isoforms they hit
+            fw_candidates_sorted = sorted(all_fw, key=lambda f: len(fw_index.get(f, set()).intersection(pending)), reverse=True)
+
+            # limit to top N forwards to speed up (tune as needed). Keep large for accuracy.
+            MAX_FW_TO_TEST = min(len(fw_candidates_sorted), 200)
+            for fw in fw_candidates_sorted[:MAX_FW_TO_TEST]:
+                # isoforms where this fw exists and are still pending
+                iso_candidates = fw_index.get(fw, set()).intersection(pending)
+                if not iso_candidates:
+                    continue
+
+                # For this forward, build a map rv -> set of isoforms (subset of iso_candidates) it can pair with
+                rv_cov_map = {}
+
+                for iso in iso_candidates:
+                    seq = seq_map[iso]
+                    fw_pos = seq.find(fw)
+                    if fw_pos == -1:
+                        continue
+                    # For each reverse-template present in this isoform, check if its RC pairs with fw (positions, product size)
+                    for rv_template in rv_kmers_by_isoform.get(iso, set()):
+                        rv_rc = rv_to_rc.get(rv_template)
+                        if not rv_rc:
+                            # if rv_template not in rv_to_rc keys (shouldn't happen), compute:
+                            rv_rc = reverse_complement(rv_template)
+                            rv_to_rc[rv_template] = rv_rc
+                        rv_pos = seq.find(rv_rc)
+                        if rv_pos == -1:
+                            continue
+                        if fw_pos >= rv_pos:  # forward must be upstream of reverse
+                            continue
+                        product_size = (rv_pos + len(rv_rc)) - fw_pos
+                        if not (prod_min <= product_size <= prod_max):
+                            continue
+                        rv_cov_map.setdefault(rv_rc, set()).add(iso)
+
+                # choose best rv for this fw
+                if not rv_cov_map:
+                    continue
+                # pick rv that covers most isoforms (intersection with pending)
+                best_rv_for_fw, covered_iso = max(rv_cov_map.items(), key=lambda it: len(it[1].intersection(pending)))
+                covered_iso = covered_iso.intersection(pending)
+                if len(covered_iso) > len(best_cover):
+                    best_cover = covered_iso
+                    best_pair = (fw, best_rv_for_fw)
+
+            # If no pair adds coverage, break
+            if not best_pair or not best_cover:
+                break
+
+            # record pair and remove covered isoforms
+            selected_pairs.append({
+                "forward": best_pair[0],
+                "reverse": best_pair[1],
+                "isoforms": sorted(list(best_cover))
+            })
+            pending -= best_cover
+
+        return {"selected": selected_pairs, "pending": sorted(list(pending))}
+
+    else:
+        # RACE: simpler greedy using intersections of k-mer hit sets (unchanged)
+        combinations = []
+        for fw_kmer, fw_hits in fw_index.items():
+            for rv_kmer, rv_hits in rv_index.items():
+                common_hits = fw_hits.intersection(rv_hits)
+                if common_hits:
+                    combinations.append((fw_kmer, rv_kmer, common_hits))
+
+        selected = []
+        while pending and combinations:
+            best_pair = max(combinations, key=lambda item: len(item[2].intersection(pending)))
+            fw, rv, covered_by_best = best_pair
+            newly_covered = covered_by_best.intersection(pending)
+            if not newly_covered:
+                break
+            selected.append({"forward": fw, "reverse": rv, "isoforms": list(newly_covered)})
+            pending -= newly_covered
+            combinations.remove(best_pair)
+
+        return {"selected": selected, "pending": sorted(list(pending))}
 # ============================================================================== 
 # --- SCRIPT EXECUTION --- 
 # ==============================================================================
