@@ -313,17 +313,20 @@ def design_race_primers(sequences, params, mode):
 def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
     """
     Finds a minimal set of primer pairs to amplify all isoforms (Set Cover Problem).
+    This uses a greedy algorithm approach for efficiency.
     """
     all_isoform_names = {rec.id for rec in sequences}
     params = params_qpcr if primer_type == "qPCR" else params_race
 
+    # --- only change: for qPCR use the ENTIRE sequence as both regions ---
     def get_regions(seq_str):
         if primer_type == "qPCR":
-            return (seq_str[params["fw_start"] - 1:params["fw_end"]],
-                    seq_str[params["rev_start"] - 1:params["rev_end"]])
-        else: # RACE
-            return (seq_str[:params["window_size"]], seq_str[-params["window_size"]:])
+            # For qPCR we scan the full sequence (forward and reverse searches use full seq)
+            return seq_str, seq_str
+        else:  # RACE (use windows at ends)
+            return seq_str[:params["window_size"]], seq_str[-params["window_size"]:]
 
+    # Pre-compute all valid k-mers and the isoforms they hit.
     fw_kmer_hits = {}
     rv_kmer_hits = {}
     for rec in sequences:
@@ -338,17 +341,21 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
             if params["gc_min"] <= calculate_gc_content(kmer) <= params["gc_max"]:
                 rv_kmer_hits.setdefault(kmer, set()).add(rec.id)
 
+    # Use a greedy algorithm to find the best primer pairs.
     selected_pairs = []
     pending_isoforms = all_isoform_names.copy()
 
+    # Create all potential primer pair combinations and their coverage.
     combinations = []
     for fw_kmer, fw_hits in fw_kmer_hits.items():
         for rv_kmer, rv_hits in rv_kmer_hits.items():
+            # The coverage of a pair is the intersection of isoforms hit by each primer.
             common_hits = fw_hits.intersection(rv_hits)
             if common_hits:
                 combinations.append((fw_kmer, rv_kmer, common_hits))
 
     while pending_isoforms and combinations:
+        # Find the pair that covers the most remaining isoforms
         best_pair = max(combinations, key=lambda item: len(item[2].intersection(pending_isoforms)))
         fw, rv, covered_by_best = best_pair
         newly_covered = covered_by_best.intersection(pending_isoforms)
