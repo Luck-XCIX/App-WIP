@@ -231,22 +231,18 @@ def design_qpcr_primers(sequences, params, mode):
 def design_race_primers(sequences, params, mode):
     """
     Main logic for designing RACE primers for either specificity or coverage.
-    CORRECTED: Now validates primer positions in terminal regions.
     """
     sequences_tuple = prepare_sequences_for_caching(sequences)
     best_primers = {}
     other_options = {}
     
-    for rec in sequences:
-        name = rec.id
-        seq = str(rec.seq)
-        
-        # Skip sequences too short for specified window size
-        if len(seq) < 2 * params["window_size"]:
-            best_primers[name] = None
-            other_options[name] = []
-            continue
-        
+    valid_sequences = [(rec.id, str(rec.seq)) for rec in sequences
+                       if len(str(rec.seq)) >= 2 * params["window_size"]]
+    
+    if not valid_sequences:
+        return {"best": best_primers, "other": other_options}
+    
+    for name, seq in valid_sequences:
         fw_region = seq[:params["window_size"]]
         rev_region = seq[-params["window_size"]:]
         rev_template = reverse_complement(rev_region)
@@ -269,6 +265,13 @@ def design_race_primers(sequences, params, mode):
             params["tm_max"]
         )
         
+        print(f"\n🧬 Isoform: {name}")
+        print(f"Forward region: {fw_region[:50]}...")
+        print(f"Reverse region: {rev_region[:50]}...")
+        print(f"Rev template strand: {rev_template[:50]}...")
+        print(f"First FW primers: {fw_candidates[:3]}")
+        print(f"First REV primers: {rev_candidates[:3]}")
+        
         if not fw_candidates or not rev_candidates:
             best_primers[name] = None
             other_options[name] = []
@@ -285,36 +288,14 @@ def design_race_primers(sequences, params, mode):
             valid_fw = [fw for fw, check in fw_checks.items() if isoform_id in check["isoforms"]]
             valid_rev = [rv for rv, check in rev_checks.items() if isoform_id in check["isoforms"]]
         
+        print(f"Valid FW (specific): {[p[:10] for p in valid_fw]}")
+        print(f"Valid REV (specific): {[p[:10] for p in valid_rev]}")
+        
         best_pair = None
         other_pairs = []
         
-        # CORRECTED: Add position validation for RACE primers
         for fw, rv in product(valid_fw, valid_rev):
-            # Find positions in full sequence
-            fw_pos = seq.find(fw)
-            rv_rc = reverse_complement(rv)
-            rv_pos = seq.find(rv_rc)
-            
-            # Validate forward primer is in 5' region
-            if fw_pos == -1 or fw_pos >= params["window_size"]:
-                continue
-            
-            # Validate reverse primer is in 3' region
-            if rv_pos == -1 or rv_pos < (len(seq) - params["window_size"]):
-                continue
-            
-            # Ensure forward is upstream of reverse
-            if fw_pos >= rv_pos:
-                continue
-            
-            # Calculate product size
-            product_size = (rv_pos + len(rv_rc)) - fw_pos
-            
-            primer_pair = {
-                "forward": fw,
-                "reverse": rv,
-                "product_size": product_size
-            }
+            primer_pair = {"forward": fw, "reverse": rv, "product_size": None}
             
             if mode == "specificity":
                 if not best_pair:
@@ -330,12 +311,12 @@ def design_race_primers(sequences, params, mode):
 def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
     """
     Finds a minimal set of primer pairs to amplify all isoforms (Set Cover Problem).
-    CORRECTED: Now validates Tm and product size for qPCR, and positions for RACE.
+    FIXED: Now properly validates qPCR primer pairs with Tm and product size.
     """
     all_isoform_names = {rec.id for rec in sequences}
     params = params_qpcr if primer_type == "qPCR" else params_race
     
-    # Pre-compute valid k-mers per isoform
+    # Pre-compute valid k-mers per isoform with Tm validation
     fw_kmers_by_isoform = {}
     rv_kmers_by_isoform = {}
     
@@ -352,7 +333,7 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
         fw_valid = set()
         rv_valid = set()
         
-        # CORRECTED: Extract valid forward k-mers WITH Tm validation
+        # Extract valid forward k-mers with GC AND Tm validation
         for kmer in extract_kmers(fw_region, params["k_range"]):
             gc = calculate_gc_content(kmer)
             tm = calculate_melting_temp(kmer)
@@ -360,7 +341,7 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
                 params["tm_min"] <= tm <= params["tm_max"]):
                 fw_valid.add(kmer)
         
-        # CORRECTED: Extract valid reverse k-mers WITH Tm validation
+        # Extract valid reverse k-mers with GC AND Tm validation
         if primer_type == "qPCR":
             rv_region_to_use = rv_region
         else:  # RACE
@@ -376,10 +357,11 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
         fw_kmers_by_isoform[rec.id] = fw_valid
         rv_kmers_by_isoform[rec.id] = rv_valid
     
-    # CORRECTED: Build coverage validation function
+    # Build coverage validation function
     def get_pair_coverage(fw_primer, rv_primer):
         """Returns set of all isoforms that this pair can amplify."""
         covered = set()
+        
         for rec in sequences:
             isoform_id = rec.id
             seq_str = str(rec.seq)
@@ -393,7 +375,7 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
             fw_pos = seq_str.find(fw_primer)
             
             if primer_type == "qPCR":
-                # CORRECTED: Validate product size for qPCR
+                # For qPCR, validate position and product size
                 rv_rc = reverse_complement(rv_primer)
                 rv_pos = seq_str.find(rv_rc)
                 
@@ -402,17 +384,12 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
                     if params["prod_min"] <= product_size <= params["prod_max"]:
                         covered.add(isoform_id)
             else:  # RACE
-                # CORRECTED: Validate primers are in correct terminal regions
-                rv_rc = reverse_complement(rv_primer)
-                rv_pos = seq_str.find(rv_rc)
-                
-                # Forward must be in 5' region
-                if fw_pos != -1 and fw_pos < params["window_size"]:
-                    # Reverse must be in 3' region
-                    if rv_pos != -1 and rv_pos >= (len(seq_str) - params["window_size"]):
-                        # Ensure forward is upstream of reverse
-                        if fw_pos < rv_pos:
-                            covered.add(isoform_id)
+                # For RACE, just check both primers exist
+                if fw_pos != -1:
+                    region_3prime = seq_str[-params["window_size"]:]
+                    rv_rc = reverse_complement(rv_primer)
+                    if rv_rc in region_3prime:
+                        covered.add(isoform_id)
         
         return covered
     
@@ -451,7 +428,7 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
         if not newly_covered:
             break
         
-        # CORRECTED: Store ALL isoforms covered by this pair
+        # Store ALL isoforms this pair amplifies (not just newly covered)
         selected_pairs.append({
             "forward": fw,
             "reverse": rv,
@@ -600,7 +577,6 @@ def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_p
         return num_sequences, best_df, other_df
     
     elif design_mode == "coverage":
-        # CORRECTED: Add more detailed output for coverage mode
         coverage_df_rows = []
         for idx, item in enumerate(results["selected"], 1):
             f, r = item["forward"], item["reverse"]
