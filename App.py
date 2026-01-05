@@ -76,10 +76,10 @@ if primer_type == "RACE":
         )
         race_params["tm_range"] = col2.slider(
             "🌡️ Melting Temperature (°C)", 
-            value=(57.0, 62.0), 
+            value=(45.0, 70.0), 
             step=0.1, 
-            min_value=50.0, 
-            max_value=65.0, 
+            min_value=0.0, 
+            max_value=100.0, 
             on_change=clear_output
         )
 
@@ -117,7 +117,7 @@ if primer_type == "qPCR":
         )
         qpcr_params["tm_range"] = col2.slider(
             "🌡️ Melting Temperature (°C)", 
-            value=(45.0, 70.0), 
+            value=(50.0, 65.0), 
             step=0.1, 
             min_value=0.0, 
             max_value=100.0, 
