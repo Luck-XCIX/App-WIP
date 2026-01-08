@@ -1,5 +1,3 @@
-Este era el codigo original, siento que hice muchos cambios y no se porque ya no funciona bien. Asi que discutamos que cambios se hicieron y como implementarlos mejor para que siga funcionando
-
 # ============================================================================== 
 # --- IMPORTS --- 
 # ==============================================================================
