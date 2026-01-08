@@ -219,7 +219,7 @@ def design_qpcr_primers(sequences, params, mode):
         )
         
         # Map reverse complement (actual primer) -> template k-mer
-        rev_candidates_map = {reverse_complement(p): p for p in rev_template_candidates}
+        rev_candidates_map = {reverse_complement(p).upper(): p.upper() for p in rev_template_candidates}
         
         if not fw_candidates or not rev_candidates_map:
             best_primers[name] = None
@@ -228,7 +228,7 @@ def design_qpcr_primers(sequences, params, mode):
         
         # Deduplicate and normalize to uppercase
         fw_candidates = list(dict.fromkeys([fw.upper() for fw in fw_candidates]))
-        rev_candidates = list(dict.fromkeys([rv.upper() for rv in rev_candidates_map.keys()]))
+        rev_candidates = list(rev_candidates_map.keys())  # already uppercase
         
         # OPTIMIZATION: Prune by Tm closeness (keep top N per side)
         fw_candidates_sorted = sorted(
@@ -348,24 +348,24 @@ def design_qpcr_primers(sequences, params, mode):
             best_primers[name] = found_pair
             other_options[name] = other_pairs
         
-        else:  # coverage mode (unchanged - simple approach)
-            fw_checks = {fw: check_cached_primer_hits(fw, sequences_tuple) for fw in fw_candidates_sorted}
-            rev_checks = {rv: check_cached_primer_hits(rv, sequences_tuple) for rv in rev_candidates_sorted}
-            
-            valid_fw = fw_candidates_sorted
-            valid_rev = rev_candidates_sorted
-            
+        else:  # coverage mode - use simpler validation
             best_pair = None
             other_pairs = []
             
-            for fw, rv in product(valid_fw, valid_rev):
+            for fw, rv in product(fw_candidates_sorted, rev_candidates_sorted):
                 fw_pos = seq.find(fw)
-                rv_template = rev_candidates_map.get(rv.upper())
-                if not rv_template:
+                if fw_pos == -1:
                     continue
-                rv_template_pos = seq.find(rv_template.upper())
                 
-                if fw_pos == -1 or rv_template_pos == -1:
+                # Get template sequence for this reverse primer
+                rv_template = rev_candidates_map.get(rv)
+                if not rv_template:
+                    # If not in map, try to compute it
+                    rv_template = reverse_complement(rv).upper()
+                
+                rv_template_pos = seq.find(rv_template)
+                
+                if rv_template_pos == -1:
                     continue
                 
                 if fw_pos >= rv_template_pos:
@@ -542,18 +542,20 @@ def design_race_primers(sequences, params, mode):
             best_primers[name] = found_pair
             other_options[name] = other_pairs
         
-        else:  # coverage mode
-            fw_checks = {fw: check_cached_primer_hits(fw, sequences_tuple) for fw in fw_candidates_sorted}
-            rev_checks = {rv: check_cached_primer_hits(rv, sequences_tuple) for rv in rev_candidates_sorted}
-            
-            valid_fw = fw_candidates_sorted
-            valid_rev = rev_candidates_sorted
-            
+        else:  # coverage mode - simpler for RACE
             best_pair = None
             other_pairs = []
             
-            for fw, rv in product(valid_fw, valid_rev):
-                primer_pair = {"forward": fw, "reverse": rv, "product_size": None}
+            # For RACE coverage, just pair any valid forward with any valid reverse
+            for fw, rv in product(fw_candidates_sorted, rev_candidates_sorted):
+                # rv here is from template strand, actual primer would be its RC
+                rv_actual = reverse_complement(rv).upper()
+                
+                primer_pair = {
+                    "forward": fw, 
+                    "reverse": rv_actual, 
+                    "product_size": None
+                }
                 
                 if not best_pair:
                     best_pair = primer_pair
