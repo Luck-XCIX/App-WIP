@@ -188,209 +188,245 @@ def design_qpcr_primers(sequences, params, mode):
     Main logic for designing qPCR primers for either specificity or coverage.
     NEW: Uses pair-based validation with progressive relaxation in specificity mode.
     """
-    sequences_tuple = prepare_sequences_for_caching(sequences)
-    best_primers = {}
-    other_options = {}
-    
-    MAX_RELAX = 4  # Maximum off-targets allowed
-    TOP_N_PER_SIDE = 60  # Prune to top N candidates by Tm
-    
-    # Precompute Tm midpoint for sorting
-    tm_mid = (params["tm_min"] + params["tm_max"]) / 2.0
-    
-    for rec in sequences:
-        name = rec.id
-        seq = str(rec.seq).upper()
+    try:
+        sequences_tuple = prepare_sequences_for_caching(sequences)
+        best_primers = {}
+        other_options = {}
         
-        if len(seq) < params["prod_min"]:
-            best_primers[name] = None
-            other_options[name] = []
-            continue
+        MAX_RELAX = 4  # Maximum off-targets allowed
+        TOP_N_PER_SIDE = 60  # Prune to top N candidates by Tm
         
-        # Scan the full sequence for forward and reverse-template candidates
-        fw_candidates = find_candidate_primers(
-            seq, params["k_range"], params["gc_min"], params["gc_max"],
-            params["tm_min"], params["tm_max"]
-        )
+        # Precompute Tm midpoint for sorting
+        tm_mid = (params["tm_min"] + params["tm_max"]) / 2.0
         
-        rev_template_candidates = find_candidate_primers(
-            seq, params["k_range"], params["gc_min"], params["gc_max"],
-            params["tm_min"], params["tm_max"]
-        )
+        print(f"🔧 DEBUG: Starting qPCR design in {mode} mode")
+        print(f"🔧 DEBUG: Processing {len(sequences)} sequences")
         
-        # Map reverse complement (actual primer) -> template k-mer
-        rev_candidates_map = {reverse_complement(p).upper(): p.upper() for p in rev_template_candidates}
-        
-        if not fw_candidates or not rev_candidates_map:
-            best_primers[name] = None
-            other_options[name] = []
-            continue
-        
-        # Deduplicate and normalize to uppercase
-        fw_candidates = list(dict.fromkeys([fw.upper() for fw in fw_candidates]))
-        rev_candidates = list(rev_candidates_map.keys())  # already uppercase
-        
-        # OPTIMIZATION: Prune by Tm closeness (keep top N per side)
-        fw_candidates_sorted = sorted(
-            fw_candidates, 
-            key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
-        )[:TOP_N_PER_SIDE]
-        
-        rev_candidates_sorted = sorted(
-            rev_candidates,
-            key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
-        )[:TOP_N_PER_SIDE]
-        
-        print(f"🔍 [{name}] After Tm pruning: {len(fw_candidates_sorted)} FW, {len(rev_candidates_sorted)} REV")
-        
-        if mode == "specificity":
-            # NEW APPROACH: Generate all valid pairs first, then apply relaxation
-            pair_candidates = []
+        for rec in sequences:
+            name = rec.id
+            seq = str(rec.seq).upper()
             
-            for fw in fw_candidates_sorted:
-                fw_pos = seq.find(fw)
-                if fw_pos == -1:
-                    continue
+            print(f"\n🔧 DEBUG: Processing {name}, seq length: {len(seq)}")
+            
+            if len(seq) < params["prod_min"]:
+                best_primers[name] = None
+                other_options[name] = []
+                continue
+            
+            # Scan the full sequence for forward and reverse-template candidates
+            fw_candidates = find_candidate_primers(
+                seq, params["k_range"], params["gc_min"], params["gc_max"],
+                params["tm_min"], params["tm_max"]
+            )
+            
+            print(f"🔧 DEBUG: Found {len(fw_candidates)} fw_candidates")
+            
+            rev_template_candidates = find_candidate_primers(
+                seq, params["k_range"], params["gc_min"], params["gc_max"],
+                params["tm_min"], params["tm_max"]
+            )
+            
+            print(f"🔧 DEBUG: Found {len(rev_template_candidates)} rev_template_candidates")
+            
+            # Map reverse complement (actual primer) -> template k-mer
+            rev_candidates_map = {reverse_complement(p).upper(): p.upper() for p in rev_template_candidates}
+            
+            print(f"🔧 DEBUG: Created rev_candidates_map with {len(rev_candidates_map)} entries")
+            
+            if not fw_candidates or not rev_candidates_map:
+                best_primers[name] = None
+                other_options[name] = []
+                continue
+            
+            # Deduplicate and normalize to uppercase
+            fw_candidates = list(dict.fromkeys([fw.upper() for fw in fw_candidates]))
+            rev_candidates = list(rev_candidates_map.keys())  # already uppercase
+            
+            print(f"🔧 DEBUG: After dedup: {len(fw_candidates)} fw, {len(rev_candidates)} rev")
+            
+            # OPTIMIZATION: Prune by Tm closeness (keep top N per side)
+            fw_candidates_sorted = sorted(
+                fw_candidates, 
+                key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
+            )[:TOP_N_PER_SIDE]
+            
+            rev_candidates_sorted = sorted(
+                rev_candidates,
+                key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
+            )[:TOP_N_PER_SIDE]
+            
+            print(f"🔍 [{name}] After Tm pruning: {len(fw_candidates_sorted)} FW, {len(rev_candidates_sorted)} REV")
+            print(f"🔧 DEBUG: Mode is '{mode}'")
+            
+            if mode == "specificity":
+                print(f"🔧 DEBUG: Entering specificity mode")
+                # NEW APPROACH: Generate all valid pairs first, then apply relaxation
+                pair_candidates = []
                 
-                for rv in rev_candidates_sorted:
-                    rv_template = rev_candidates_map.get(rv.upper())
-                    if not rv_template:
+                for fw in fw_candidates_sorted:
+                    fw_pos = seq.find(fw)
+                    if fw_pos == -1:
                         continue
                     
-                    rv_template_pos = seq.find(rv_template.upper())
+                    for rv in rev_candidates_sorted:
+                        rv_template = rev_candidates_map.get(rv.upper())
+                        if not rv_template:
+                            continue
+                        
+                        rv_template_pos = seq.find(rv_template.upper())
+                        if rv_template_pos == -1:
+                            continue
+                        
+                        # Ensure forward is before reverse
+                        if fw_pos >= rv_template_pos:
+                            continue
+                        
+                        # Calculate product size
+                        product_size = (rv_template_pos + len(rv_template)) - fw_pos
+                        
+                        if not (params["prod_min"] <= product_size <= params["prod_max"]):
+                            continue
+                        
+                        # NEW: Calculate pair coverage (which isoforms this pair amplifies)
+                        coverage = get_pair_coverage_set(fw, rv, sequences, params["prod_min"], params["prod_max"])
+                        
+                        # Sanity check: pair should amplify the target
+                        if name not in coverage:
+                            continue
+                        
+                        off_targets = len(coverage) - 1  # Exclude target itself
+                        
+                        # Compute quality metrics for sorting
+                        tm_fw = calculate_melting_temp(fw)
+                        tm_rv = calculate_melting_temp(rv)
+                        tm_diff = abs(tm_fw - tm_rv)
+                        cross_dimer = find_longest_complementary_run(fw, reverse_complement(rv))
+                        
+                        prod_mid = (params["prod_min"] + params["prod_max"]) / 2.0
+                        prod_dist = abs(product_size - prod_mid)
+                        
+                        pair_candidates.append({
+                            "forward": fw,
+                            "reverse": rv,
+                            "product_size": product_size,
+                            "coverage": coverage,
+                            "off_targets": off_targets,
+                            "tm_diff": tm_diff,
+                            "cross_dimer": cross_dimer,
+                            "prod_dist": prod_dist
+                        })
+                
+                print(f"     📊 Generated {len(pair_candidates)} valid pair candidates")
+                
+                if not pair_candidates:
+                    best_primers[name] = None
+                    other_options[name] = []
+                    continue
+                
+                # NEW: Progressive relaxation on PAIR off-targets (0 → 1 → 2 → ... → MAX_RELAX)
+                found_pair = None
+                other_pairs = []
+                
+                for allowed_off in range(0, MAX_RELAX + 1):
+                    filtered = [p for p in pair_candidates if p["off_targets"] <= allowed_off]
+                    
+                    if not filtered:
+                        continue
+                    
+                    print(f"     🎯 Relaxation level {allowed_off}: {len(filtered)} pairs available")
+                    
+                    # Sort by quality: (off_targets, tm_diff, cross_dimer, prod_dist)
+                    filtered_sorted = sorted(
+                        filtered,
+                        key=lambda p: (p["off_targets"], p["tm_diff"], p["cross_dimer"], p["prod_dist"])
+                    )
+                    
+                    # Take best pair
+                    best = filtered_sorted[0]
+                    found_pair = {
+                        "forward": best["forward"],
+                        "reverse": best["reverse"],
+                        "product_size": best["product_size"]
+                    }
+                    
+                    print(f"     ✅ Best pair: {best['off_targets']} off-targets, Tm diff={best['tm_diff']:.1f}°C")
+                    
+                    # Collect up to 10 alternates
+                    for alt in filtered_sorted[:10]:
+                        other_pairs.append({
+                            "forward": alt["forward"],
+                            "reverse": alt["reverse"],
+                            "product_size": alt["product_size"]
+                        })
+                    
+                    break  # Stop once we found candidates at this relaxation level
+                
+                best_primers[name] = found_pair
+                other_options[name] = other_pairs
+            
+            elif mode == "coverage":
+                print(f"🔧 DEBUG: Entering coverage mode")
+                # coverage mode - use simpler validation
+                best_pair = None
+                other_pairs = []
+                
+                pair_count = 0
+                for fw, rv in product(fw_candidates_sorted, rev_candidates_sorted):
+                    pair_count += 1
+                    if pair_count % 100 == 0:
+                        print(f"🔧 DEBUG: Processed {pair_count} pairs...")
+                    
+                    fw_pos = seq.find(fw)
+                    if fw_pos == -1:
+                        continue
+                    
+                    # Get template sequence for this reverse primer
+                    rv_template = rev_candidates_map.get(rv)
+                    if not rv_template:
+                        # If not in map, try to compute it
+                        rv_template = reverse_complement(rv).upper()
+                    
+                    rv_template_pos = seq.find(rv_template)
+                    
                     if rv_template_pos == -1:
                         continue
                     
-                    # Ensure forward is before reverse
                     if fw_pos >= rv_template_pos:
                         continue
                     
-                    # Calculate product size
                     product_size = (rv_template_pos + len(rv_template)) - fw_pos
                     
                     if not (params["prod_min"] <= product_size <= params["prod_max"]):
                         continue
                     
-                    # NEW: Calculate pair coverage (which isoforms this pair amplifies)
-                    coverage = get_pair_coverage_set(fw, rv, sequences, params["prod_min"], params["prod_max"])
-                    
-                    # Sanity check: pair should amplify the target
-                    if name not in coverage:
-                        continue
-                    
-                    off_targets = len(coverage) - 1  # Exclude target itself
-                    
-                    # Compute quality metrics for sorting
-                    tm_fw = calculate_melting_temp(fw)
-                    tm_rv = calculate_melting_temp(rv)
-                    tm_diff = abs(tm_fw - tm_rv)
-                    cross_dimer = find_longest_complementary_run(fw, reverse_complement(rv))
-                    
-                    prod_mid = (params["prod_min"] + params["prod_max"]) / 2.0
-                    prod_dist = abs(product_size - prod_mid)
-                    
-                    pair_candidates.append({
+                    primer_pair = {
                         "forward": fw,
                         "reverse": rv,
-                        "product_size": product_size,
-                        "coverage": coverage,
-                        "off_targets": off_targets,
-                        "tm_diff": tm_diff,
-                        "cross_dimer": cross_dimer,
-                        "prod_dist": prod_dist
-                    })
+                        "product_size": product_size
+                    }
+                    
+                    if not best_pair:
+                        best_pair = primer_pair
+                        print(f"🔧 DEBUG: Found first pair for {name}")
+                    if len(other_pairs) < 10:
+                        other_pairs.append(primer_pair)
+                
+                print(f"🔧 DEBUG: Coverage mode done for {name}, found best_pair: {best_pair is not None}")
+                best_primers[name] = best_pair
+                other_options[name] = other_pairs
             
-            print(f"     📊 Generated {len(pair_candidates)} valid pair candidates")
-            
-            if not pair_candidates:
-                best_primers[name] = None
-                other_options[name] = []
-                continue
-            
-            # NEW: Progressive relaxation on PAIR off-targets (0 → 1 → 2 → ... → MAX_RELAX)
-            found_pair = None
-            other_pairs = []
-            
-            for allowed_off in range(0, MAX_RELAX + 1):
-                filtered = [p for p in pair_candidates if p["off_targets"] <= allowed_off]
-                
-                if not filtered:
-                    continue
-                
-                print(f"     🎯 Relaxation level {allowed_off}: {len(filtered)} pairs available")
-                
-                # Sort by quality: (off_targets, tm_diff, cross_dimer, prod_dist)
-                filtered_sorted = sorted(
-                    filtered,
-                    key=lambda p: (p["off_targets"], p["tm_diff"], p["cross_dimer"], p["prod_dist"])
-                )
-                
-                # Take best pair
-                best = filtered_sorted[0]
-                found_pair = {
-                    "forward": best["forward"],
-                    "reverse": best["reverse"],
-                    "product_size": best["product_size"]
-                }
-                
-                print(f"     ✅ Best pair: {best['off_targets']} off-targets, Tm diff={best['tm_diff']:.1f}°C")
-                
-                # Collect up to 10 alternates
-                for alt in filtered_sorted[:10]:
-                    other_pairs.append({
-                        "forward": alt["forward"],
-                        "reverse": alt["reverse"],
-                        "product_size": alt["product_size"]
-                    })
-                
-                break  # Stop once we found candidates at this relaxation level
-            
-            best_primers[name] = found_pair
-            other_options[name] = other_pairs
+            else:
+                print(f"❌ ERROR: Unknown mode '{mode}'")
+                raise ValueError(f"Unknown mode: {mode}")
         
-        else:  # coverage mode - use simpler validation
-            best_pair = None
-            other_pairs = []
-            
-            for fw, rv in product(fw_candidates_sorted, rev_candidates_sorted):
-                fw_pos = seq.find(fw)
-                if fw_pos == -1:
-                    continue
-                
-                # Get template sequence for this reverse primer
-                rv_template = rev_candidates_map.get(rv)
-                if not rv_template:
-                    # If not in map, try to compute it
-                    rv_template = reverse_complement(rv).upper()
-                
-                rv_template_pos = seq.find(rv_template)
-                
-                if rv_template_pos == -1:
-                    continue
-                
-                if fw_pos >= rv_template_pos:
-                    continue
-                
-                product_size = (rv_template_pos + len(rv_template)) - fw_pos
-                
-                if not (params["prod_min"] <= product_size <= params["prod_max"]):
-                    continue
-                
-                primer_pair = {
-                    "forward": fw,
-                    "reverse": rv,
-                    "product_size": product_size
-                }
-                
-                if not best_pair:
-                    best_pair = primer_pair
-                if len(other_pairs) < 10:
-                    other_pairs.append(primer_pair)
-            
-            best_primers[name] = best_pair
-            other_options[name] = other_pairs
+        print(f"🔧 DEBUG: Finished processing all sequences")
+        return {"best": best_primers, "other": other_options}
     
-    return {"best": best_primers, "other": other_options}
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR in design_qpcr_primers: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 def design_race_primers(sequences, params, mode):
     """
