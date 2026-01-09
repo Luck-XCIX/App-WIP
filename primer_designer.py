@@ -4,6 +4,7 @@
 import re
 from itertools import product
 from functools import lru_cache
+from bisect import bisect_left, bisect_right
 import pandas as pd
 from Bio import SeqIO
 from Bio.Seq import Seq
@@ -146,89 +147,94 @@ def get_pair_coverage_set_race(fw_primer, rv_primer, sequences):
     return coverage
 
 # ============================================================================== 
-# MAIN DESIGN FUNCTIONS - WITH PAIR-BASED LOGIC
+# MAIN DESIGN FUNCTIONS - qPCR (forward-first, position-based) 
 # ============================================================================== 
 def design_qpcr_primers(sequences, params, mode):
     sequences_tuple = prepare_sequences_for_caching(sequences)
     best_primers = {}
     other_options = {}
     MAX_RELAX = 4
-    TOP_N_PER_SIDE = 60
     tm_mid = (params["tm_min"] + params["tm_max"]) / 2.0
+
     for rec in sequences:
         name = rec.id
         seq = str(rec.seq).upper()
+
         if len(seq) < params["prod_min"]:
             best_primers[name] = None
             other_options[name] = []
             continue
-        fw_candidates = find_candidate_primers(
+
+        fw_pos_cands_all = find_candidate_primers_with_positions(
             seq, params["k_range"], params["gc_min"], params["gc_max"],
             params["tm_min"], params["tm_max"]
         )
-        rev_template_candidates = find_candidate_primers(
+        rev_pos_cands_all = find_candidate_primers_with_positions(
             seq, params["k_range"], params["gc_min"], params["gc_max"],
             params["tm_min"], params["tm_max"]
         )
-        rev_candidates_map = {reverse_complement(p): p for p in rev_template_candidates}
-        if not fw_candidates or not rev_candidates_map:
+
+        if not fw_pos_cands_all or not rev_pos_cands_all:
             best_primers[name] = None
             other_options[name] = []
             continue
-        fw_candidates = list(dict.fromkeys([fw.upper() for fw in fw_candidates]))
-        rev_candidates = list(dict.fromkeys([rv.upper() for rv in rev_candidates_map.keys()]))
-        fw_candidates_sorted = sorted(
-            fw_candidates, 
-            key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
-        )[:TOP_N_PER_SIDE]
-        rev_candidates_sorted = sorted(
-            rev_candidates,
-            key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
-        )[:TOP_N_PER_SIDE]
-        print(f"🔍 [{name}] After Tm pruning: {len(fw_candidates_sorted)} FW, {len(rev_candidates_sorted)} REV")
-        if mode == "specificity":
-            pair_candidates = []
-            for fw in fw_candidates_sorted:
-                fw_pos = seq.find(fw)
-                if fw_pos == -1:
+
+        rev_list_by_pos = sorted(rev_pos_cands_all, key=lambda kv: kv[1])
+        rev_positions = [pos for (_kmer, pos) in rev_list_by_pos]
+
+        pair_candidates = []
+
+        for fw_kmer, fw_pos in fw_pos_cands_all:
+            rv_search_min = fw_pos + 1
+            rv_search_max = fw_pos + params["prod_max"]
+
+            left_idx = bisect_left(rev_positions, rv_search_min)
+            right_idx = bisect_right(rev_positions, rv_search_max)
+
+            for rv_kmer, rv_pos in rev_list_by_pos[left_idx:right_idx]:
+                if fw_pos >= rv_pos:
                     continue
-                for rv in rev_candidates_sorted:
-                    rv_template = rev_candidates_map.get(rv.upper())
-                    if not rv_template:
-                        continue
-                    rv_template_pos = seq.find(rv_template.upper())
-                    if rv_template_pos == -1:
-                        continue
-                    if fw_pos >= rv_template_pos:
-                        continue
-                    product_size = (rv_template_pos + len(rv_template)) - fw_pos
-                    if not (params["prod_min"] <= product_size <= params["prod_max"]):
-                        continue
-                    coverage = get_pair_coverage_set(fw, rv, sequences, params["prod_min"], params["prod_max"])
-                    if name not in coverage:
-                        continue
-                    off_targets = len(coverage) - 1
-                    tm_fw = calculate_melting_temp(fw)
-                    tm_rv = calculate_melting_temp(rv)
-                    tm_diff = abs(tm_fw - tm_rv)
-                    cross_dimer = find_longest_complementary_run(fw, reverse_complement(rv))
-                    prod_mid = (params["prod_min"] + params["prod_max"]) / 2.0
-                    prod_dist = abs(product_size - prod_mid)
-                    pair_candidates.append({
-                        "forward": fw,
-                        "reverse": rv,
-                        "product_size": product_size,
-                        "coverage": coverage,
-                        "off_targets": off_targets,
-                        "tm_diff": tm_diff,
-                        "cross_dimer": cross_dimer,
-                        "prod_dist": prod_dist
-                    })
-            print(f"     📊 Generated {len(pair_candidates)} valid pair candidates")
-            if not pair_candidates:
-                best_primers[name] = None
-                other_options[name] = []
-                continue
+
+                L_rv = len(rv_kmer)
+                product_size = (rv_pos + L_rv) - fw_pos
+                if not (params["prod_min"] <= product_size <= params["prod_max"]):
+                    continue
+
+                rv_actual = reverse_complement(rv_kmer)
+
+                coverage = get_pair_coverage_set(fw_kmer, rv_actual, sequences, params["prod_min"], params["prod_max"])
+                if name not in coverage:
+                    continue
+
+                off_targets = len(coverage) - 1
+                tm_fw = calculate_melting_temp(fw_kmer)
+                tm_rv = calculate_melting_temp(rv_actual)
+                tm_diff = abs(tm_fw - tm_rv)
+                cross_dimer = find_longest_complementary_run(fw_kmer, reverse_complement(rv_actual))
+                prod_mid = (params["prod_min"] + params["prod_max"]) / 2.0
+                prod_dist = abs(product_size - prod_mid)
+
+                pair_candidates.append({
+                    "forward": fw_kmer,
+                    "fw_pos": fw_pos,
+                    "reverse": rv_actual,
+                    "rv_pos": rv_pos,
+                    "product_size": product_size,
+                    "coverage": coverage,
+                    "off_targets": off_targets,
+                    "tm_diff": tm_diff,
+                    "cross_dimer": cross_dimer,
+                    "prod_dist": prod_dist
+                })
+
+        print(f"🔍 [{name}] Generated {len(pair_candidates)} position-based pair candidates")
+
+        if not pair_candidates:
+            best_primers[name] = None
+            other_options[name] = []
+            continue
+
+        if mode == "specificity":
             found_pair = None
             other_pairs = []
             for allowed_off in range(0, MAX_RELAX + 1):
@@ -246,68 +252,18 @@ def design_qpcr_primers(sequences, params, mode):
                     "reverse": best["reverse"],
                     "product_size": best["product_size"]
                 }
-                print(f"     ✅ Best pair: {best['off_targets']} off-targets, Tm diff={best['tm_diff']:.1f}°C")
                 for alt in filtered_sorted[:10]:
                     other_pairs.append({
                         "forward": alt["forward"],
                         "reverse": alt["reverse"],
                         "product_size": alt["product_size"]
                     })
+                print(f"     ✅ Best pair: {best['off_targets']} off-targets, Tm diff={best['tm_diff']:.1f}°C")
                 break
             best_primers[name] = found_pair
             other_options[name] = other_pairs
-        else:
-            fw_pos_cands = find_candidate_primers_with_positions(
-                seq, params["k_range"], params["gc_min"], params["gc_max"], 
-                params["tm_min"], params["tm_max"]
-            )
-            rev_template_pos_cands = find_candidate_primers_with_positions(
-                seq, params["k_range"], params["gc_min"], params["gc_max"], 
-                params["tm_min"], params["tm_max"]
-            )
-            if not fw_pos_cands or not rev_template_pos_cands:
-                best_primers[name] = None
-                other_options[name] = []
-                continue
-            rev_list = rev_template_pos_cands
-            pair_candidates = []
-            for fw_kmer, fw_pos in fw_pos_cands:
-                for rv_kmer, rv_pos in rev_list:
-                    if fw_pos >= rv_pos:
-                        continue
-                    L_rv = len(rv_kmer)
-                    product_size = (rv_pos + L_rv) - fw_pos
-                    if not (params["prod_min"] <= product_size <= params["prod_max"]):
-                        continue
-                    rv_actual = reverse_complement(rv_kmer)
-                    coverage = get_pair_coverage_set(fw_kmer, rv_actual, sequences, 
-                                                    params["prod_min"], params["prod_max"])
-                    if name not in coverage:
-                        continue
-                    off_targets = len(coverage) - 1
-                    tm_fw = calculate_melting_temp(fw_kmer)
-                    tm_rv = calculate_melting_temp(rv_actual)
-                    tm_diff = abs(tm_fw - tm_rv)
-                    cross_dimer = find_longest_complementary_run(fw_kmer, reverse_complement(rv_actual))
-                    prod_mid = (params["prod_min"] + params["prod_max"]) / 2.0
-                    prod_dist = abs(product_size - prod_mid)
-                    pair_candidates.append({
-                        "forward": fw_kmer,
-                        "fw_pos": fw_pos,
-                        "reverse": rv_actual,
-                        "rv_pos": rv_pos,
-                        "product_size": product_size,
-                        "coverage": coverage,
-                        "off_targets": off_targets,
-                        "tm_diff": tm_diff,
-                        "cross_dimer": cross_dimer,
-                        "prod_dist": prod_dist
-                    })
-            print(f"     📊 Coverage mode: Generated {len(pair_candidates)} valid pair candidates")
-            if not pair_candidates:
-                best_primers[name] = None
-                other_options[name] = []
-                continue
+
+        else:  # coverage
             pair_candidates_sorted = sorted(
                 pair_candidates,
                 key=lambda p: (-len(p["coverage"]), p["tm_diff"], p["cross_dimer"], p["prod_dist"])
@@ -328,14 +284,17 @@ def design_qpcr_primers(sequences, params, mode):
             print(f"     ✅ Best pair covers {len(best['coverage'])} isoforms, Tm diff={best['tm_diff']:.1f}°C")
             best_primers[name] = best_pair
             other_options[name] = other_pairs
+
     return {"best": best_primers, "other": other_options}
 
+# ============================================================================== 
+# RACE design (unchanged) 
+# ============================================================================== 
 def design_race_primers(sequences, params, mode):
     sequences_tuple = prepare_sequences_for_caching(sequences)
     best_primers = {}
     other_options = {}
     MAX_RELAX = 4
-    TOP_N_PER_SIDE = 60
     tm_mid = (params["tm_min"] + params["tm_max"]) / 2.0
     valid_sequences = [(rec.id, str(rec.seq)) for rec in sequences
                        if len(str(rec.seq)) >= 2 * params["window_size"]]
@@ -362,11 +321,11 @@ def design_race_primers(sequences, params, mode):
         fw_candidates_sorted = sorted(
             fw_candidates,
             key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
-        )[:TOP_N_PER_SIDE]
+        )
         rev_candidates_sorted = sorted(
             rev_candidates,
             key=lambda k: abs(calculate_melting_temp(k) - tm_mid)
-        )[:TOP_N_PER_SIDE]
+        )
         print(f"🔍 [{name}] RACE - After Tm pruning: {len(fw_candidates_sorted)} FW, {len(rev_candidates_sorted)} REV")
         if mode == "specificity":
             pair_candidates = []
@@ -448,6 +407,9 @@ def design_race_primers(sequences, params, mode):
             other_options[name] = other_pairs
     return {"best": best_primers, "other": other_options}
 
+# ============================================================================== 
+# SET COVER (unchanged) 
+# ============================================================================== 
 def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
     all_isoform_names = {rec.id for rec in sequences}
     params = params_qpcr if primer_type == "qPCR" else params_race
@@ -491,7 +453,7 @@ def find_coverage_primers(sequences, params_qpcr, params_race, primer_type):
     return {"selected": selected_pairs, "pending": list(pending_isoforms)}
 
 # ============================================================================== 
-# --- SCRIPT EXECUTION --- 
+# SCRIPT / IO HELPERS 
 # ============================================================================== 
 def parse_params(qpcr_params, race_params):
     if qpcr_params:
@@ -545,11 +507,12 @@ def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_p
     else:
         print(f"⚠️ Unsupported design mode: {design_mode}")
         return None, None, None
+
     if design_mode == "specificity":
         best_df_rows = []
         other_df_rows = []
         for isoform_name, pair in results["best"].items():
-            if not pair: 
+            if not pair:
                 continue
             f, r = pair["forward"], pair["reverse"]
             best_df_rows.append({
@@ -589,12 +552,13 @@ def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_p
                 })
         best_df = pd.DataFrame(best_df_rows) if best_df_rows else None
         other_df = pd.DataFrame(other_df_rows) if other_df_rows else None
-        if best_df is not None and not best_df.empty: 
+        if best_df is not None and not best_df.empty:
             best_df.index = range(1, len(best_df) + 1)
-        if other_df is not None and not other_df.empty: 
+        if other_df is not None and not other_df.empty:
             other_df.index = range(1, len(other_df) + 1)
         print("✅ Finished specificity design.")
         return num_sequences, best_df, other_df
+
     elif design_mode == "coverage":
         coverage_df_rows = []
         for item in results["selected"]:
@@ -604,7 +568,7 @@ def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_p
                 "Covered_Isoforms": ";".join(item["isoforms"]),
             })
         coverage_df = pd.DataFrame(coverage_df_rows) if coverage_df_rows else None
-        if coverage_df is not None and not coverage_df.empty: 
+        if coverage_df is not None and not coverage_df.empty:
             coverage_df.index = range(1, len(coverage_df) + 1)
         print("✅ Finished coverage design.")
         return num_sequences, coverage_df, None
@@ -612,17 +576,17 @@ def create_design(fasta_file_path, primer_type, design_mode, qpcr_params, race_p
 if __name__ == "__main__":
     FASTA_FILE_PATH = "./sample_data/avengers-3.fa"
     PRIMER_TYPE = "RACE"
-    DESIGN_MODE = "specificity" 
+    DESIGN_MODE = "specificity"
     PARAMS_QPCR = {
-        'k_range': (18, 26), 
-        'gc_range': (0.5, 0.7), 
-        'prod_range': (80, 150), 
+        'k_range': (18, 26),
+        'gc_range': (0.5, 0.7),
+        'prod_range': (80, 150),
         'tm_range': (57.0, 62.0)
     }
     PARAMS_RACE = {
-        'window_size': 200, 
-        'k_range': (23, 29), 
-        'gc_range': (0.5, 0.7), 
+        'window_size': 200,
+        'k_range': (23, 29),
+        'gc_range': (0.5, 0.7),
         'tm_range': (57.0, 62.0)
     }
     create_design(FASTA_FILE_PATH, PRIMER_TYPE, DESIGN_MODE, PARAMS_QPCR, PARAMS_RACE)
